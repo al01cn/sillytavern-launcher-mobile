@@ -2,14 +2,22 @@ package cn.al01.sillytavern_launcher;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+
+import android.annotation.SuppressLint;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import java.io.File;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.util.Objects;
 
 import android.system.Os;
@@ -22,8 +30,9 @@ public class MainActivity extends AppCompatActivity {
     private ProgressBar progressBar;
     private TextView progressMessage;
 
-    // 成员变量
     private Button btnLaunch;
+    private WebView webView;
+    private View mainLayout; // 用于隐藏初始 UI
 
     static {
         try {
@@ -44,8 +53,14 @@ public class MainActivity extends AppCompatActivity {
 
         // 1. 初始化 UI 和基础环境
         setupBaseEnvironment();
+
         btnLaunch = findViewById(R.id.btn_launch);
-        btnLaunch.setEnabled(false); // 初始禁用
+        webView = findViewById(R.id.webview_main);
+        mainLayout = findViewById(R.id.main_container); // 假设你的 XML 里有一个根容器
+
+        initWebView();
+
+        btnLaunch.setEnabled(false);
 
         // 2. 检查资源状态
         checkResourcesAndPrepare();
@@ -53,9 +68,58 @@ public class MainActivity extends AppCompatActivity {
         // 3. 点击启动按钮逻辑
         btnLaunch.setOnClickListener(v -> {
             btnLaunch.setEnabled(false);
-            btnLaunch.setText("正在运行...");
+            btnLaunch.setText("正在启动...");
             startSillyTavern();
+            // 开始监控端口，准备切换页面
+            monitorPortAndSwitch(11451);
         });
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private void initWebView() {
+        WebSettings settings = webView.getSettings();
+
+        // 1. 核心配置：必须开启
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true); // 酒馆可能用到 WebSQL/IndexedDB
+
+        // 2. 资源访问权限：酒馆某些主题或插件可能需要访问本地资源
+        settings.setAllowFileAccess(true);
+        settings.setAllowContentAccess(true);
+        settings.setAllowFileAccessFromFileURLs(true);
+        settings.setAllowUniversalAccessFromFileURLs(true);
+
+        // 3. 界面展示优化
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        settings.setSupportZoom(true);
+        settings.setBuiltInZoomControls(true);
+        settings.setDisplayZoomControls(false);
+
+        // 4. 【重要】解决无法加载的关键：允许混合内容
+        // 因为本地服务经常被识别为不安全环境
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+
+        // 5. 优化白名单拦截逻辑
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+//                String url = request.getUrl().toString();
+                // 更加宽松的本地匹配
+                // 允许在 WebView 内跳转
+                // 如果是外部链接，可以考虑用浏览器打开而不是直接拦截
+                return false;
+            }
+
+            @Override
+            public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
+                Log.e(TAG, "WebView 错误: " + description + " 地址: " + failingUrl);
+            }
+        });
+
+        // 开发环境下开启调试（可选，方便你在电脑 Chrome 调试手机 WebView）
+        WebView.setWebContentsDebuggingEnabled(true);
     }
 
     private void setupBaseEnvironment() {
@@ -68,84 +132,147 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * 逻辑：先检查解压，再检查 Git
-     */
     private void checkResourcesAndPrepare() {
         File stFolder = SillyTavern.getRootFolder(this);
         File serverJs = new File(stFolder, "server.js");
 
         if (!stFolder.exists() || !serverJs.exists()) {
-            // 首次启动，需要解压
             showProgressDialog();
             new Thread(() -> {
                 boolean success = SillyTavern.unzipSource(this, this::updateProgress);
                 runOnUiThread(() -> {
                     if (progressDialog != null) progressDialog.dismiss();
                     if (success) {
-                        // 解压成功后，紧接着准备 Git
                         prepareGitEnvironment();
                     } else {
-                        showErrorDialog("解压酒馆源码失败，请确保 assets 中有 sillytavern.7z");
+                        showErrorDialog("解压酒馆源码失败");
                         btnLaunch.setText("资源缺失");
                     }
                 });
             }).start();
         } else {
-            // 资源已存在，直接准备 Git
             prepareGitEnvironment();
         }
     }
 
-    /**
-     * 在后台静默准备 Git，完成后激活启动按钮
-     */
     private void prepareGitEnvironment() {
+        File stFolder = SillyTavern.getRootFolder(this);
         runOnUiThread(() -> btnLaunch.setText("正在配置 Git..."));
-
         new Thread(() -> {
             boolean gitReady = GitManager.setup(this);
             runOnUiThread(() -> {
                 if (gitReady) {
-                    btnLaunch.setEnabled(true);
-                    btnLaunch.setText("启动酒馆");
-                    Log.i(TAG, "环境准备就绪");
+                    ensureGitRepo(stFolder);
+                    btnLaunch.setEnabled(false);
+                    btnLaunch.setText("正在初始化 Git 元数据");
                 } else {
                     btnLaunch.setText("环境配置失败");
-                    showErrorDialog("Git 环境初始化失败，请检查 lib 库文件。");
                 }
             });
         }).start();
     }
 
-    /**
-     * 点击按钮后的最终启动逻辑
-     */
     private void startSillyTavern() {
         File stFolder = SillyTavern.getRootFolder(this);
         new Thread(() -> {
-            // 1. 应用补丁
             Polyfill.applyPatch(stFolder);
-
-            // 2. 获取入口
             File entry = SillyTavern.findEntryScript(stFolder, "server.js");
             if (entry != null) {
-                Log.i(TAG, "启动酒馆中...");
                 chdirNative(Objects.requireNonNull(entry.getParentFile()).getAbsolutePath());
+                // 注意：startNodeWithArguments 通常是阻塞的，所以它后面的代码可能不会立即执行
                 startNodeWithArguments(SillyTavern.getLaunchArguments(entry.getAbsolutePath()));
-            } else {
-                runOnUiThread(() -> {
-                    showErrorDialog("未找到 server.js 入口文件。");
-                    btnLaunch.setEnabled(true);
-                    btnLaunch.setText("启动酒馆");
-                });
             }
         }).start();
     }
 
+    /**
+     * 轮询检测本地端口，成功后切换到 WebView
+     */
+    private void monitorPortAndSwitch(int port) {
+        new Thread(() -> {
+            boolean connected = false;
+            int attempts = 0;
+            while (!connected && attempts < 30) { // 最多尝试 30 秒
+                try {
+                    Thread.sleep(1000);
+                    Socket socket = new Socket();
+                    socket.connect(new InetSocketAddress("127.0.0.1", port), 500);
+                    socket.close();
+                    connected = true;
+                } catch (Exception e) {
+                    attempts++;
+                    Log.d(TAG, "等待端口 " + port + " 开放... (" + attempts + ")");
+                }
+            }
+
+            if (connected) {
+                try {
+                    Thread.sleep(500);
+                    runOnUiThread(() -> {
+                        // 隐藏启动 UI，显示 WebView
+                        mainLayout.setVisibility(View.GONE);
+                        webView.setVisibility(View.VISIBLE);
+                        webView.loadUrl("http://127.0.0.1:" + port);
+                    });
+                } catch (InterruptedException e) {
+                    runOnUiThread(() -> showErrorDialog("延迟启用失败，请检查控制台输出。"));
+                    throw new RuntimeException(e);
+                }
+            } else {
+                runOnUiThread(() -> showErrorDialog("酒馆启动超时，请检查控制台输出。"));
+            }
+        }).start();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (webView.getVisibility() == View.VISIBLE && webView.canGoBack()) {
+            webView.goBack();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    /**
+     * 自动初始化 Git 仓库，解决 fatal: not a git repository 报错
+     */
+    private void ensureGitRepo(File folder) {
+        File gitDir = new File(folder, ".git");
+        if (!gitDir.exists()) {
+            Log.i(TAG, "Initializing git repository in " + folder.getAbsolutePath());
+            try {
+                ProcessBuilder pb = new ProcessBuilder("git", "init");
+                // 继承 GitManager 设置好的路径
+                pb.environment().put("PATH", Os.getenv("PATH"));
+                pb.environment().put("LD_LIBRARY_PATH", Os.getenv("LD_LIBRARY_PATH"));
+                pb.environment().put("HOME", Os.getenv("HOME"));
+                pb.environment().put("GIT_EXEC_PATH", Os.getenv("GIT_EXEC_PATH"));
+
+                pb.directory(folder);
+                pb.redirectErrorStream(true);
+                Process p = pb.start();
+                p.waitFor();
+                Log.i(TAG, "Git init success");
+                new Thread(() -> {
+                    boolean gitReady = GitManager.setup(this);
+                    runOnUiThread(() -> {
+                        if (gitReady) {
+                            btnLaunch.setEnabled(true);
+                            btnLaunch.setText("一键启动酒馆");
+                        } else {
+                            btnLaunch.setText("Git元数据，初始化失败");
+                        }
+                    });
+                }).start();
+            } catch (Exception e) {
+                Log.e(TAG, "Git init failed: " + e.getMessage());
+            }
+        }
+    }
+
     private void showProgressDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle("首次启动：正在解压资源").setCancelable(false);
+//        builder.setTitle("正在解压资源").setCancelable(false);
         View v = LayoutInflater.from(this).inflate(R.layout.dialog_progress, null);
         progressBar = v.findViewById(R.id.progress_bar);
         progressMessage = v.findViewById(R.id.progress_message);
@@ -162,7 +289,7 @@ public class MainActivity extends AppCompatActivity {
                 progressBar.setProgress(current);
             }
             if (progressMessage != null) {
-                progressMessage.setText("已解压: " + percent + "%");
+                progressMessage.setText(getString(R.string.extracting_msg, percent));
             }
         });
     }

@@ -18,10 +18,6 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# --- SillyTavern User Data (建议排除，除非你想把私聊记录传到 GitHub) ---
-# 如果你把 ST 源码放进了 assets 或特定目录，记得保护隐私数据
-/app/src/main/assets/sillytavern.zip
-
 # --- OS / IDE Specific ---
 .DS_Store
 Thumbs.db
@@ -34,3 +30,4 @@ Thumbs.db
 *.a
 *.o
 *.d
+/app/release/*

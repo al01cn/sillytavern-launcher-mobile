@@ -11,13 +11,19 @@ public class MainActivity extends AppCompatActivity {
 
     // 1. 加载原生库 (必须按顺序：先 node，后 native-lib)
     static {
-        System.loadLibrary("node");
-        System.loadLibrary("native-lib");
+        try {
+            // 尝试加载 node
+            System.loadLibrary("native-lib");
+            System.loadLibrary("node");
+            Log.i("NodeJS", "所有原生库加载成功");
+        } catch (UnsatisfiedLinkError e) {
+            // 这里会打印出到底是哪个库找不到了
+            Log.e("NodeJS", "原生库加载失败: " + e.getMessage());
+        }
     }
 
     // 2. 声明 C++ 中的 native 方法
     // 注意：这个方法名对应 C++ 里的 Java_com_example_sillytavern_MainActivity_startNodeWithArguments
-    public native int startNodeWithArguments(String[] arguments);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -33,14 +39,23 @@ public class MainActivity extends AppCompatActivity {
             }
         }).start();
     }
+    public native int startNodeWithArguments(String[] arguments);
 
     // 在 MainActivity.java 中修改
     private void startSillyTavern() {
         try {
+            // 设置必要的环境变量，防止 Node 内部崩溃
+            String filesDir = getFilesDir().getAbsolutePath();
+            android.system.Os.setenv("HOME", filesDir, true);
+            android.system.Os.setenv("TMPDIR", getCacheDir().getAbsolutePath(), true);
+
+            Log.i("NodeJS", "Current ABI: " + android.os.Build.SUPPORTED_ABIS[0]);
             Log.i("NodeJS", "正在尝试加载参数并启动...");
+
             String[] nodeArgs = {"node", "-v"};
 
             // 调用 native 方法
+
             int exitCode = startNodeWithArguments(nodeArgs);
             Log.i("NodeJS", "Node.js 运行结束，状态码: " + exitCode);
         } catch (UnsatisfiedLinkError e) {
@@ -49,4 +64,5 @@ public class MainActivity extends AppCompatActivity {
             Log.e("NodeJS", "启动发生异常: " + e.getMessage());
         }
     }
+
 }

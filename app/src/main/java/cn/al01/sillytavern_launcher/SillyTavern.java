@@ -1,15 +1,18 @@
 package cn.al01.sillytavern_launcher;
 
 import android.content.Context;
+import android.util.Log;
+import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
+import org.apache.commons.compress.archivers.sevenz.SevenZFile;
+import org.apache.commons.compress.utils.SeekableInMemoryByteChannel;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
 
 public class SillyTavern {
-    public static final String ZIP_NAME = "sillytavern.zip";
     public static final String TARGET_DIR_NAME = "SillyTavern";
+    private static final String TAG = "SillyTavern";
+    private static final String SOURCE_ASSET = "sillytavern.7z"; // 修改为你的文件名
 
     public interface ProgressListener {
         void onProgress(int current, int total);
@@ -19,37 +22,65 @@ public class SillyTavern {
         return new File(context.getFilesDir(), TARGET_DIR_NAME);
     }
 
+    /**
+     * 将 Assets 中的 7z 文件转换为内存字节通道，以便 SevenZFile 读取
+     * 注意：如果 7z 文件非常大（如超过 200MB），建议先存为临时文件再读取
+     */
+    private static byte[] getAssetBytes(Context context) throws Exception {
+        try (InputStream is = context.getAssets().open(SillyTavern.SOURCE_ASSET)) {
+            int size = is.available();
+            byte[] buffer = new byte[size];
+            is.read(buffer);
+            return buffer;
+        }
+    }
+
     public static boolean unzipSource(Context context, ProgressListener listener) {
+        File root = getRootFolder(context);
+        if (!root.exists()) root.mkdirs();
+
         try {
-            File root = getRootFolder(context);
-            if (!root.exists()) root.mkdirs();
+            // 1. 读取 7z 文件到内存通道
+            // 如果文件巨大导致 OOM，请改用 File 缓存
+            byte[] data = getAssetBytes(context);
+            SeekableInMemoryByteChannel channel = new SeekableInMemoryByteChannel(data);
 
-            int total = 0;
-            try (InputStream is = context.getAssets().open(ZIP_NAME); ZipInputStream zis = new ZipInputStream(is)) {
-                while (zis.getNextEntry() != null) { total++; zis.closeEntry(); }
-            }
+            try (SevenZFile sevenZFile = new SevenZFile(channel)) {
+                // 2. 统计总数
+                int total = 0;
+                Iterable<SevenZArchiveEntry> entries = sevenZFile.getEntries();
+                for (SevenZArchiveEntry entry : entries) {
+                    if (!entry.isDirectory()) total++;
+                }
 
-            try (InputStream is = context.getAssets().open(ZIP_NAME); ZipInputStream zis = new ZipInputStream(is)) {
-                ZipEntry ze;
-                byte[] buffer = new byte[1024 * 64];
+                // 3. 重新读取进行解压
                 int count = 0;
-                while ((ze = zis.getNextEntry()) != null) {
-                    File file = new File(root, ze.getName());
-                    if (ze.isDirectory()) file.mkdirs();
-                    else {
+                SevenZArchiveEntry entry;
+                while ((entry = sevenZFile.getNextEntry()) != null) {
+                    File file = new File(root, entry.getName());
+
+                    if (entry.isDirectory()) {
+                        file.mkdirs();
+                    } else {
                         File parent = file.getParentFile();
                         if (parent != null && !parent.exists()) parent.mkdirs();
+
                         try (FileOutputStream fos = new FileOutputStream(file)) {
-                            int len; while ((len = zis.read(buffer)) > 0) fos.write(buffer, 0, len);
+                            byte[] content = new byte[8192];
+                            int len;
+                            while ((len = sevenZFile.read(content)) > 0) {
+                                fos.write(content, 0, len);
+                            }
                         }
+                        count++;
+                        if (listener != null) listener.onProgress(count, total);
                     }
-                    count++;
-                    if (listener != null) listener.onProgress(count, total);
-                    zis.closeEntry();
                 }
             }
             return true;
         } catch (Exception e) {
+            Log.e(TAG, "7z 解压失败: " + e.getMessage());
+            e.printStackTrace();
             return false;
         }
     }

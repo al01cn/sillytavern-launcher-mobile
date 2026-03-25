@@ -6,4 +6,5 @@
     <string name="extracting_title">正在初始化资源</string>
     <string name="extracting_msg">第一次运行需要解压资源文件，请勿关闭应用…\n进度: %1$d%%</string>
     <string name="extract_fail">解压失败，请检查存储空间</string>
+    <string name="start_sillytavern">启动酒馆</string>
 </resources>

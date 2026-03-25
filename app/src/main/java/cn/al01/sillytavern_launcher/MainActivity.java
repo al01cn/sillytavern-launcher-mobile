@@ -16,6 +16,9 @@ import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.Objects;
@@ -132,6 +135,41 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 初始化配置文件：如果酒馆里没有 settings.json，就从 assets 复制过去
+     */
+    private void initializeSettingsFile() {
+        File defaultUserDir = new File(SillyTavern.getRootFolder(this), "data/default-user");
+        File settingsFile = new File(defaultUserDir, "settings.json");
+        
+        if (!settingsFile.exists()) {
+            Log.i(TAG, "Settings 文件不存在，正在从 assets 复制默认配置...");
+            
+            // 确保目录存在
+            if (!defaultUserDir.exists()) {
+                defaultUserDir.mkdirs();
+            }
+            
+            // 从 assets 复制文件
+            try (InputStream is = getAssets().open("st_config/settings.json");
+                 FileOutputStream fos = new FileOutputStream(settingsFile)) {
+                
+                byte[] buffer = new byte[8192];
+                int len;
+                while ((len = is.read(buffer)) > 0) {
+                    fos.write(buffer, 0, len);
+                }
+                
+                Log.i(TAG, "Settings 文件复制成功到：" + settingsFile.getAbsolutePath());
+            } catch (Exception e) {
+                Log.e(TAG, "复制 Settings 文件失败：" + e.getMessage());
+                e.printStackTrace();
+            }
+        } else {
+            Log.i(TAG, "Settings 文件已存在，跳过初始化");
+        }
+    }
+
     private void checkResourcesAndPrepare() {
         File stFolder = SillyTavern.getRootFolder(this);
         File serverJs = new File(stFolder, "server.js");
@@ -143,6 +181,8 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     if (progressDialog != null) progressDialog.dismiss();
                     if (success) {
+                        // 解压成功后，初始化配置文件
+                        initializeSettingsFile();
                         prepareGitEnvironment();
                     } else {
                         showErrorDialog("解压酒馆源码失败");
@@ -163,8 +203,6 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 if (gitReady) {
                     ensureGitRepo(stFolder);
-                    btnLaunch.setEnabled(false);
-                    btnLaunch.setText("正在初始化 Git 元数据");
                 } else {
                     btnLaunch.setText("环境配置失败");
                 }
@@ -241,33 +279,37 @@ public class MainActivity extends AppCompatActivity {
         if (!gitDir.exists()) {
             Log.i(TAG, "Initializing git repository in " + folder.getAbsolutePath());
             try {
+                btnLaunch.setEnabled(false);
+                btnLaunch.setText("正在初始化 Git 元数据");
                 ProcessBuilder pb = new ProcessBuilder("git", "init");
                 // 继承 GitManager 设置好的路径
                 pb.environment().put("PATH", Os.getenv("PATH"));
                 pb.environment().put("LD_LIBRARY_PATH", Os.getenv("LD_LIBRARY_PATH"));
                 pb.environment().put("HOME", Os.getenv("HOME"));
                 pb.environment().put("GIT_EXEC_PATH", Os.getenv("GIT_EXEC_PATH"));
-
+    
                 pb.directory(folder);
                 pb.redirectErrorStream(true);
                 Process p = pb.start();
                 p.waitFor();
                 Log.i(TAG, "Git init success");
-                new Thread(() -> {
-                    boolean gitReady = GitManager.setup(this);
-                    runOnUiThread(() -> {
-                        if (gitReady) {
-                            btnLaunch.setEnabled(true);
-                            btnLaunch.setText("一键启动酒馆");
-                        } else {
-                            btnLaunch.setText("Git元数据，初始化失败");
-                        }
-                    });
-                }).start();
             } catch (Exception e) {
                 Log.e(TAG, "Git init failed: " + e.getMessage());
             }
         }
+            
+        // 无论是新建还是已存在，都检查 Git 状态并启用按钮
+        new Thread(() -> {
+            boolean gitReady = GitManager.setup(this);
+            runOnUiThread(() -> {
+                if (gitReady) {
+                    btnLaunch.setEnabled(true);
+                    btnLaunch.setText("一键启动酒馆");
+                } else {
+                    btnLaunch.setText("Git 元数据，初始化失败");
+                }
+            });
+        }).start();
     }
 
     private void showProgressDialog() {

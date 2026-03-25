@@ -11,180 +11,249 @@ import android.system.Os;
 import android.system.ErrnoException;
 
 /**
- * GitManager 最终强化版
- * 支持：libpcre2-8.so, libiconv.so, libz.so.1 自动修复
- * 逻辑：优先使用 Assets 中的库，缺失时尝试从系统拷贝
+ * GitManager 终极补全版
+ * 1. 自动处理所有 Git 及其依赖库 (Curl, SSL, SSH2, HTTP2, IDN2) 的版本别名
+ * 2. 修复模板路径和环境路径
+ * 3. 增强对 git-remote-https 等子程序的修复
+ * 4. 修复 HTTPS 克隆所需的 SSL 证书路径
  */
 public class GitManager {
     private static final String TAG = "GitManager";
-    private static final String BIN_DIR_NAME = "bin";
+    private static final String GIT_DIR_NAME = "git";
+    private static final String SO_DIR_NAME = "lib";
 
     public static boolean setup(Context context) {
         try {
-            File binDir = new File(context.getFilesDir(), BIN_DIR_NAME);
-            if (!binDir.exists()) binDir.mkdirs();
+            File filesDir = context.getFilesDir();
+            File gitRoot = new File(filesDir, GIT_DIR_NAME);
+            File soRoot = new File(filesDir, SO_DIR_NAME);
 
-            // 1. 释放 Assets 中的所有组件 (git, libpcre2-8.so, libiconv.so 等)
-            // 请确保文件放在 assets/git/bin/[arch]/ 目录下
-            if (!installGitComponents(context, binDir)) return false;
+            if (!gitRoot.exists()) gitRoot.mkdirs();
+            if (!soRoot.exists()) soRoot.mkdirs();
 
-            // 2. 补全 Android 系统缺失或名称不匹配的库 (如 libz.so.1)
-            repairSystemLibraryLinks(binDir);
-
-            // 3. 修复 Git 助手程序 (解决 git clone https 协议不支持问题)
-            repairAllHelpers(binDir);
-
-            // 4. 环境变量注入 (注入 PATH, LD_LIBRARY_PATH, GIT_EXEC_PATH)
-            injectEnvironment(context, binDir.getAbsolutePath());
-
-            // 5. 验证执行
-            return verifyGit(binDir);
-
-        } catch (Exception e) {
-            Log.e(TAG, "Git 初始化过程中发生崩溃", e);
-            return false;
-        }
-    }
-
-    private static boolean installGitComponents(Context context, File binDir) {
-        try {
+            // 1. 架构识别
             String abi = Build.SUPPORTED_ABIS[0];
-            String arch = abi.contains("arm64") ? "arm64-v8a" : (abi.contains("x86_64") ? "x86_64" : "armeabi-v7a");
-            String assetFolder = "git/bin/" + arch;
+            String arch = abi.equalsIgnoreCase("x86_64") ? "x86_64" :
+                    (abi.contains("arm64") ? "arm64-v8a" : "armeabi-v7a");
 
-            String[] files = context.getAssets().list(assetFolder);
-            if (files == null || files.length == 0) {
-                Log.e(TAG, "Assets 目录为空或未找到: " + assetFolder);
+            Log.i(TAG, "检测架构: " + arch + " -> 准备提取全量依赖...");
+
+            // 2. 提取 Git 核心资源 (二进制文件)
+            String gitAssetPath = "lib/git/" + arch;
+            if (!syncAssets(context, gitAssetPath, gitRoot)) {
+                Log.e(TAG, "❌ 提取 Git 核心失败");
                 return false;
             }
 
-            for (String fileName : files) {
-                String assetPath = assetFolder + "/" + fileName;
+            // 3. 提取并处理所有 SO 库及其版本别名
+            extractAllSoLibraries(context, arch, soRoot);
 
-                try {
-                    String[] sub = context.getAssets().list(assetPath);
-                    if (sub != null && sub.length > 0) continue;
-                } catch (Exception ignored) {}
-
-                File destFile = new File(binDir, fileName);
-
-                if (!destFile.exists() || fileName.equals("git") || fileName.endsWith(".so") || fileName.contains(".so.")) {
-                    try (InputStream is = context.getAssets().open(assetPath);
-                         FileOutputStream fos = new FileOutputStream(destFile)) {
-                        byte[] buffer = new byte[1024 * 64];
-                        int len;
-                        while ((len = is.read(buffer)) > 0) fos.write(buffer, 0, len);
-                    }
-                }
-                destFile.setExecutable(true, false);
-                destFile.setReadable(true, false);
+            // 4. 定位主程序
+            File gitMain = new File(gitRoot, "libexec/git-core/git");
+            if (!gitMain.exists()) {
+                Log.e(TAG, "❌ 找不到 Git: " + gitMain.getAbsolutePath());
+                return false;
             }
-            return true;
+
+            // 5. 修复辅助程序 (git-remote-https 是 HTTPS 克隆的核心)
+            File gitCoreDir = new File(gitRoot, "libexec/git-core");
+            repairBrokenSymlinks(gitMain, gitCoreDir);
+
+            // 5.5 提取 CA 证书 (解决 HTTPS 克隆时 SSL 验证失败问题)
+            File cacertFile = new File(filesDir, "cacert.pem");
+            // 根据用户反馈，证书在 assets/ca/ 目录下
+            String cacertAssetPath = "ca/cacert.pem";
+            try {
+                // 每次启动都校验一下，确保证书路径正确注入
+                extractSingleFile(context, cacertAssetPath, cacertFile);
+                Log.i(TAG, "✅ 证书已提取到: " + cacertFile.getAbsolutePath());
+            } catch (Exception e) {
+                Log.w(TAG, "⚠️ 提取证书失败，请确认 assets/ca/cacert.pem 是否存在: " + e.getMessage());
+            }
+
+            // 6. 环境注入
+            injectEnvironment(context, gitRoot, soRoot, gitCoreDir);
+
+            // 7. 最终验证
+            return verifyGit(gitMain);
         } catch (Exception e) {
-            Log.e(TAG, "从 Assets 释放资源失败", e);
+            Log.e(TAG, "Git 初始化失败", e);
             return false;
         }
     }
 
-    private static void repairSystemLibraryLinks(File binDir) {
-        // 只有当 Assets 里没提供这些库时，才尝试从系统拷贝
-        String[] libsToFix = {"libz.so:libz.so.1"};
-        String[] systemPaths = {
-                "/system/lib64", "/system/lib",
-                "/apex/com.android.runtime/lib64", "/apex/com.android.runtime/lib"
-        };
+    private static void extractAllSoLibraries(Context context, String arch, File soDestDir) {
+        try {
+            String[] libFolders = context.getAssets().list("lib");
+            if (libFolders == null) return;
 
-        for (String pair : libsToFix) {
-            String[] parts = pair.split(":");
-            String srcName = parts[0];
-            String dstName = parts[1];
-            File dstFile = new File(binDir, dstName);
+            for (String folderName : libFolders) {
+                if (folderName.equals("git")) continue;
 
-            if (!dstFile.exists()) {
-                for (String sPath : systemPaths) {
-                    File srcFile = new File(sPath, srcName);
-                    if (srcFile.exists()) {
-                        try {
-                            copyFile(srcFile, dstFile);
-                            dstFile.setExecutable(true, false);
-                            Log.i(TAG, "已从系统补全库: " + dstName + " (源: " + sPath + ")");
-                            break;
-                        } catch (Exception e) {
-                            Log.w(TAG, "尝试拷贝系统库失败: " + srcName);
+                String archSpecificPath = "lib/" + folderName + "/" + arch;
+                String[] files = context.getAssets().list(archSpecificPath);
+
+                if (files != null && files.length > 0) {
+                    for (String fileName : files) {
+                        if (fileName.endsWith(".so") && !isAssetDirectory(context, archSpecificPath + "/" + fileName)) {
+                            File targetFile = new File(soDestDir, fileName);
+                            extractSingleFile(context, archSpecificPath + "/" + fileName, targetFile);
+                            handleLibraryAliases(soDestDir, fileName);
                         }
                     }
                 }
             }
+        } catch (Exception e) {
+            Log.e(TAG, "SO 库提取出错", e);
         }
     }
 
-    private static void repairAllHelpers(File binDir) {
-        File gitMain = new File(binDir, "git");
-        if (!gitMain.exists()) return;
-
-        String[] helpers = {
-                "git-remote-http", "git-remote-https", "git-remote-ftp", "git-remote-ftps",
-                "git-receive-pack", "git-upload-pack"
-        };
-
-        for (String hName : helpers) {
-            File hFile = new File(binDir, hName);
-            if (!hFile.exists() || (hFile.length() < 10000 && hFile.length() != gitMain.length())) {
-                try {
-                    copyFile(gitMain, hFile);
-                    hFile.setExecutable(true, false);
-                    Log.d(TAG, "助手已修复: " + hName);
-                } catch (Exception e) {
-                    Log.e(TAG, "修复助手失败: " + hName);
-                }
-            }
-        }
-    }
-
-    private static void injectEnvironment(Context context, String binPath) {
+    private static void handleLibraryAliases(File dir, String fileName) {
         try {
-            String oldPath = System.getenv("PATH");
-            Os.setenv("PATH", binPath + ":" + (oldPath != null ? oldPath : ""), true);
-            Os.setenv("GIT_EXEC_PATH", binPath, true);
-
-            String oldLd = System.getenv("LD_LIBRARY_PATH");
-            String newLd = binPath + ":" + (oldLd != null ? oldLd : "/system/lib64:/system/lib");
-            Os.setenv("LD_LIBRARY_PATH", newLd, true);
-
-            Os.setenv("HOME", context.getFilesDir().getAbsolutePath(), true);
-            Log.i(TAG, "Git 环境变量注入完成");
-        } catch (ErrnoException e) {
-            Log.e(TAG, "环境变量注入出错", e);
-        }
-    }
-
-    private static boolean verifyGit(File binDir) {
-        try {
-            String gitPath = new File(binDir, "git").getAbsolutePath();
-            Process p = Runtime.getRuntime().exec(new String[]{gitPath, "--version"});
-            int code = p.waitFor();
-
-            if (code == 0) {
-                Log.i(TAG, "✅ Git 验证成功！所有依赖 (.so) 已就绪。");
-                return true;
-            } else {
-                InputStream es = p.getErrorStream();
-                byte[] b = new byte[Math.max(0, es.available())];
-                es.read(b);
-                Log.e(TAG, "❌ Git 验证失败，错误详情: " + new String(b));
+            if (fileName.equals("libz.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libz.so.1"));
+            } else if (fileName.equals("libpcre2-8.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libpcre2-8.so.0"));
+            } else if (fileName.equals("libcurl.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libcurl.so.4"));
+            } else if (fileName.equals("libcrypto.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libcrypto.so.3"));
+                createAlias(new File(dir, fileName), new File(dir, "libcrypto.so.1.1"));
+            } else if (fileName.equals("libssl.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libssl.so.3"));
+                createAlias(new File(dir, fileName), new File(dir, "libssl.so.1.1"));
+            } else if (fileName.equals("libnghttp2.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libnghttp2.so.14"));
+            } else if (fileName.equals("libssh2.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libssh2.so.1"));
+            } else if (fileName.equals("libidn2.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libidn2.so.0"));
+            } else if (fileName.equals("libiconv.so")) {
+                createAlias(new File(dir, fileName), new File(dir, "libiconv.so.2"));
             }
         } catch (Exception e) {
-            Log.e(TAG, "验证 Git 过程中发生异常", e);
+            Log.w(TAG, "创建别名失败: " + fileName, e);
         }
-        return false;
+    }
+
+    private static void createAlias(File src, File dst) throws Exception {
+        if (dst.exists()) return;
+        copyFile(src, dst);
+        dst.setExecutable(true, true);
+        dst.setReadable(true, true);
+    }
+
+    private static boolean isAssetDirectory(Context context, String path) {
+        try {
+            String[] list = context.getAssets().list(path);
+            return list != null && list.length > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean syncAssets(Context context, String assetPath, File destDir) {
+        try {
+            String[] items = context.getAssets().list(assetPath);
+            if (items == null || items.length == 0) return true;
+
+            for (String item : items) {
+                String fullAssetPath = assetPath + "/" + item;
+                File targetFile = new File(destDir, item);
+
+                if (isAssetDirectory(context, fullAssetPath)) {
+                    if (!targetFile.exists()) targetFile.mkdirs();
+                    syncAssets(context, fullAssetPath, targetFile);
+                } else {
+                    extractSingleFile(context, fullAssetPath, targetFile);
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static void extractSingleFile(Context context, String assetPath, File destFile) throws Exception {
+        try (InputStream is = context.getAssets().open(assetPath);
+             FileOutputStream fos = new FileOutputStream(destFile)) {
+            byte[] buffer = new byte[1024 * 64];
+            int len;
+            while ((len = is.read(buffer)) > 0) fos.write(buffer, 0, len);
+            destFile.setExecutable(true, true);
+            destFile.setReadable(true, true);
+        }
+    }
+
+    private static void repairBrokenSymlinks(File gitMain, File gitCoreDir) {
+        if (!gitCoreDir.exists()) return;
+        String[] helpers = {"git-remote-http", "git-remote-https", "git-remote-ftp", "git-remote-ftps"};
+        for (String hName : helpers) {
+            File hFile = new File(gitCoreDir, hName);
+            if (!hFile.exists() || hFile.length() < 1024) {
+                try {
+                    copyFile(gitMain, hFile);
+                    hFile.setExecutable(true, true);
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private static void injectEnvironment(Context context, File gitRoot, File soRoot, File gitCoreDir) {
+        try {
+            String soPath = soRoot.getAbsolutePath();
+            String corePath = gitCoreDir.getAbsolutePath();
+
+            Os.setenv("LD_LIBRARY_PATH", soPath + ":" + System.getenv("LD_LIBRARY_PATH"), true);
+            Os.setenv("PATH", corePath + ":" + gitRoot.getAbsolutePath() + ":" + System.getenv("PATH"), true);
+
+            File templateDir = new File(gitRoot, "share/git-core/templates");
+            if (!templateDir.exists()) templateDir.mkdirs();
+            Os.setenv("GIT_TEMPLATE_DIR", templateDir.getAbsolutePath(), true);
+
+            Os.setenv("GIT_EXEC_PATH", corePath, true);
+            Os.setenv("HOME", context.getFilesDir().getAbsolutePath(), true);
+
+            // 注入 SSL 证书环境变量
+            File cacertFile = new File(context.getFilesDir(), "cacert.pem");
+            if (cacertFile.exists()) {
+                String certPath = cacertFile.getAbsolutePath();
+                Os.setenv("GIT_SSL_CAINFO", certPath, true);
+                Os.setenv("CURL_CA_BUNDLE", certPath, true);
+                Os.setenv("SSL_CERT_FILE", certPath, true);
+            } else {
+                Os.setenv("GIT_SSL_CAPATH", "/system/etc/security/cacerts", true);
+            }
+        } catch (ErrnoException e) {
+            Log.e(TAG, "环境注入失败", e);
+        }
+    }
+
+    private static boolean verifyGit(File gitExe) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(gitExe.getAbsolutePath(), "--version");
+            pb.environment().put("LD_LIBRARY_PATH", Os.getenv("LD_LIBRARY_PATH"));
+            pb.environment().put("GIT_EXEC_PATH", Os.getenv("GIT_EXEC_PATH"));
+            pb.environment().put("GIT_TEMPLATE_DIR", Os.getenv("GIT_TEMPLATE_DIR"));
+            pb.environment().put("PATH", Os.getenv("PATH"));
+            pb.environment().put("HOME", Os.getenv("HOME"));
+
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            InputStream is = p.getInputStream();
+            byte[] b = new byte[1024];
+            int l = is.read(b);
+            if (l > 0) Log.i(TAG, "Git 验证: " + new String(b, 0, l));
+            return p.waitFor() == 0;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static void copyFile(File src, File dst) throws Exception {
-        try (FileInputStream in = new FileInputStream(src);
-             FileOutputStream out = new FileOutputStream(dst)) {
+        try (FileInputStream in = new FileInputStream(src); FileOutputStream out = new FileOutputStream(dst)) {
             byte[] buf = new byte[1024 * 64];
-            int len;
-            while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
+            int len; while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
         }
     }
 }

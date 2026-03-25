@@ -9,6 +9,7 @@ local.properties
 .externalNativeBuild/
 obj/
 bin/
+logs/
 
 # --- Node.js / SillyTavern ---
 node_modules/

@@ -10,6 +10,7 @@ local.properties
 obj/
 bin/
 logs/
+SillyTavern-src/
 
 # --- Node.js / SillyTavern ---
 node_modules/
@@ -24,6 +25,7 @@ Thumbs.db
 *.swp
 *~
 .vscode/
+.workbuddy/
 
 # --- Native / C++ ---
 *.so

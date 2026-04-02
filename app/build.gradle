@@ -29,9 +29,8 @@ android {
     defaultConfig {
         applicationId "cn.al01.sillytavern_launcher"
         minSdk 24
-        targetSdk 34
         versionCode 1
-        versionName '0.1.1'
+        versionName '0.1.1.1'
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         signingConfig signingConfigs.debug
@@ -81,11 +80,11 @@ tasks.register("prepareGitExecutables") {
     doLast {
         gitAbis.each { abi ->
             def abiDir = file("src/main/jniLibs/git/${abi}")
-            def srcGit = file("${abiDir}/libexec/git-core/git")
+            def srcGit = file("${abiDir}/bin/git")
             def dstGitSo = file("${abiDir}/libgit.so")
             def dstGitCmd = file("${abiDir}/git")
 
-            if (!srcGit.exists()) {
+            if (!srcGit.exists() || srcGit.length() == 0L) {
                 throw new GradleException("缺少 Git 可执行文件: ${srcGit}")
             }
 
@@ -118,6 +117,7 @@ tasks.register("prepareGitExecutables") {
         }
     }
 }
+
 
 
 tasks.named("preBuild").configure {

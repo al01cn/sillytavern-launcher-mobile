@@ -71,15 +71,19 @@ public class GitManager {
             String arch = abi.equalsIgnoreCase("x86_64") ? "x86_64" :
                     (abi.contains("arm64") ? "arm64-v8a" : "armeabi-v7a");
 
+            ApplicationInfo appInfo = context.getApplicationInfo();
+            File nativeLibDir = new File(appInfo.nativeLibraryDir);
             lg.i(TAG, "========== Git 环境初始化开始 ==========");
             lg.i(TAG, "设备 ABI: " + abi);
             lg.i(TAG, "选定架构: " + arch);
+            lg.i(TAG, "nativeLibraryDir: " + nativeLibDir.getAbsolutePath());
             lg.i(TAG, "目标目录: " + gitRoot.getAbsolutePath());
             lg.i(TAG, "库目录: " + soRoot.getAbsolutePath());
             lg.i(TAG, "API 级别: " + Build.VERSION.SDK_INT);
 
             // 2. 确定 git 主程序路径
-            File gitMain = resolveGitMain(context, arch, gitRoot, lg);
+            File gitMain = resolveGitMain(context, arch, gitRoot, nativeLibDir, lg);
+
             if (gitMain == null || !gitMain.exists()) {
                 setLastError("无法定位 Git 主程序（未找到 jniLibs/libgit.so，且 assets 提取失败）");
                 lg.e(TAG, "无法定位 Git 主程序");
@@ -109,10 +113,20 @@ public class GitManager {
 
 
             File gitCoreDir = new File(gitRoot, "libexec/git-core");
-            repairBrokenSymlinks(gitMain, gitCoreDir);
+            File activeGitExecDir = mapExecutableToHelperDir(gitMain, gitRoot, nativeLibDir, arch, lg);
+
+            if (activeGitExecDir == null || activeGitExecDir.getAbsolutePath().equals(gitCoreDir.getAbsolutePath())) {
+                activeGitExecDir = gitCoreDir;
+                repairBrokenSymlinks(gitMain, gitCoreDir);
+            } else {
+                lg.i(TAG, "Git helper 指向 jniLibs 目录: " + activeGitExecDir.getAbsolutePath());
+            }
+
+
 
             // 5.5 提取 CA 证书
             File cacertFile = new File(filesDir, "cacert.pem");
+
             try {
                 extractSingleFile(context, "ca/cacert.pem", cacertFile);
                 lg.i(TAG, "证书已提取到: " + cacertFile.getAbsolutePath());
@@ -121,7 +135,9 @@ public class GitManager {
             }
 
             // 6. 环境注入
-            injectEnvironment(context, gitRoot, soRoot, gitCoreDir);
+            injectEnvironment(context, gitRoot, soRoot, gitCoreDir, gitMain, activeGitExecDir);
+
+
 
             // 7. 最终验证
             boolean result = verifyGit(gitMain, lg);
@@ -141,23 +157,35 @@ public class GitManager {
      * 解析 Git 主程序路径
      * 优先级: jniLibs > filesDir > assets
      */
-    private static File resolveGitMain(Context context, String arch, File gitRoot, AppLogger lg) {
+    private static File resolveGitMain(Context context, String arch, File gitRoot, File nativeLibDir, AppLogger lg) {
         // 方案 1: jniLibs 路径 (Android 10+ 推荐)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            File jniPath = new File(context.getApplicationInfo().nativeLibraryDir, JNI_GIT_MAIN);
-            File jniAltPath = new File(context.getApplicationInfo().nativeLibraryDir, JNI_GIT_MAIN_ALT);
+            File jniPath = new File(nativeLibDir, "git");
+            if (jniPath.exists()) {
+                lg.i(TAG, "优先使用 jniLibs/git 可执行: " + jniPath.getAbsolutePath());
+                return jniPath;
+            }
 
-            lg.i(TAG, "检查 jniLibs: " + jniPath.getAbsolutePath());
+            File jniLibGitSo = new File(nativeLibDir, JNI_GIT_MAIN);
+            File jniAltPath = new File(nativeLibDir, JNI_GIT_MAIN_ALT);
+
+            lg.i(TAG, "检查 jniLibs/git 可执行: " + jniPath.getAbsolutePath());
             lg.i(TAG, "  - 存在: " + jniPath.exists() + ", 大小: " + (jniPath.exists() ? jniPath.length() : 0) + " bytes");
+            lg.i(TAG, "检查 libgit.so: " + jniLibGitSo.getAbsolutePath());
+            lg.i(TAG, "  - 存在: " + jniLibGitSo.exists() + ", 大小: " + (jniLibGitSo.exists() ? jniLibGitSo.length() : 0) + " bytes");
             lg.i(TAG, "检查 jniLibs(备用): " + jniAltPath.getAbsolutePath());
             lg.i(TAG, "  - 存在: " + jniAltPath.exists() + ", 大小: " + (jniAltPath.exists() ? jniAltPath.length() : 0) + " bytes");
 
             if (jniPath.exists()) {
-                lg.i(TAG, "使用 jniLibs 方案 (Android 10+ 可执行): " + JNI_GIT_MAIN);
+                lg.i(TAG, "使用 jniLibs 方案 (Android 10+ 可执行): /git");
                 return jniPath;
             }
 
-            // Android 10+ 无法执行 filesDir，可返回失败并提示打包 libgit.so
+            if (jniLibGitSo.exists() && jniLibGitSo.length() > 1024 * 1024) {
+                lg.i(TAG, "未找到独立 git，使用 libgit.so 作为可执行入口");
+                return jniLibGitSo;
+            }
+
 
             if (jniAltPath.exists()) {
                 setLastError("检测到 libgit2.so，但它是共享库不是 Git 可执行主程序；请为当前 ABI 打包 libgit.so（可执行 Git）");
@@ -165,14 +193,15 @@ public class GitManager {
                 return null;
             }
 
-            // Android 10+ 上，filesDir 属于 app_data_file，容易被 SELinux execute_no_trans 拒绝
-            setLastError("Android 10+ 设备未找到 jniLibs Git 主程序（libgit.so）。请为当前 ABI 打包可执行 Git 库");
-            lg.e(TAG, "Android 10+ 未找到 jniLibs Git 主程序: " + jniPath.getAbsolutePath());
-            lg.i(TAG, "提示：请将可执行 git 二进制以 libgit.so 形式放入 jniLibs/git/<abi>/ 或 nativeLibraryDir 对应 ABI 目录");
+            setLastError("Android 10+ 设备未找到 jniLibs Git 主程序（git/libgit.so）。请为当前 ABI 打包可执行 Git 库");
+            lg.e(TAG, "提示：请将可执行 git 二进制以 libgit.so 或 git 形式放入 jniLibs/git/<abi>/ 并重新构建");
             return null;
 
 
+
         }
+
+
 
 
         // 方案 2: filesDir/git/libexec/git-core/git (仅 Android 9 及以下)
@@ -376,28 +405,97 @@ public class GitManager {
         }
     }
 
-    private static void injectEnvironment(Context context, File gitRoot, File soRoot, File gitCoreDir) {
+    private static File mapExecutableToHelperDir(File gitMain, File gitRoot, File nativeLibDir, String arch, AppLogger lg) {
+        try {
+            if (gitMain == null) return null;
+            File gitParent = gitMain.getParentFile();
+            if (nativeLibDir != null) {
+                File baseDir = nativeLibDir;
+                // /data/app/.../lib/<abi>/git/libexec/git-core
+                if (arch != null) {
+                    File archCandidate = new File(baseDir, "git/" + arch + "/libexec/git-core");
+                    if (archCandidate.exists()) {
+                        return archCandidate;
+                    }
+                }
+                File candidate = new File(baseDir, "git/libexec/git-core");
+                if (candidate.exists()) {
+                    return candidate;
+                }
+                File candidateDirect = new File(baseDir, "libexec/git-core");
+                if (candidateDirect.exists()) {
+                    return candidateDirect;
+                }
+                File parentOfBase = baseDir.getParentFile();
+                if (parentOfBase != null) {
+                    File candidateParent = new File(parentOfBase, "git/libexec/git-core");
+                    if (candidateParent.exists()) {
+                        return candidateParent;
+                    }
+                    File nestedCandidate = new File(parentOfBase, "libexec/git-core");
+                    if (nestedCandidate.exists()) {
+                        return nestedCandidate;
+                    }
+                }
+            }
+
+            if (gitParent != null) {
+                File sibling = new File(gitParent, "libexec/git-core");
+                if (sibling.exists()) {
+                    return sibling;
+                }
+                File parentSibling = gitParent.getParentFile();
+                if (parentSibling != null) {
+                    File parentCandidate = new File(parentSibling, "libexec/git-core");
+                    if (parentCandidate.exists()) {
+                        return parentCandidate;
+                    }
+                    File nestedCandidate = new File(parentSibling, "git/libexec/git-core");
+                    if (nestedCandidate.exists()) {
+                        return nestedCandidate;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            lg.w(TAG, "mapExecutableToHelperDir 异常: " + e.getMessage());
+        }
+        File fallback = new File(gitRoot, "libexec/git-core");
+        return fallback.exists() ? fallback : fallback;
+    }
+
+
+
+    private static void injectEnvironment(Context context, File gitRoot, File soRoot, File gitCoreDir, File gitMain, File activeGitCoreDir) {
+
+
         try {
             String soPath = soRoot.getAbsolutePath();
-            String corePath = gitCoreDir.getAbsolutePath();
+            File helperDir = (activeGitCoreDir != null ? activeGitCoreDir : gitCoreDir);
+            String helperPath = helperDir.getAbsolutePath();
             String nativeLibDir = context.getApplicationInfo().nativeLibraryDir;
-            String nativeGitPath = nativeLibDir + "/git";
+            String nativeGitPath = gitMain.getAbsolutePath();
+
 
             String oldLd = Os.getenv("LD_LIBRARY_PATH");
             String oldPath = Os.getenv("PATH");
             String mergedLd = appendPath(soPath, oldLd);
 
-            String preferredPathHead = nativeLibDir + ":" + corePath + ":" + gitRoot.getAbsolutePath();
+            String preferredPathHead = gitMain.getParent() + ":" + helperPath + ":" + gitRoot.getAbsolutePath();
 
             String mergedPath = appendPath(preferredPathHead, oldPath);
+
 
             Log.i(TAG, "Inject PATH=" + mergedPath);
 
             Os.setenv("LD_LIBRARY_PATH", mergedLd, true);
             Os.setenv("PATH", mergedPath, true);
-            Os.setenv("ANDROID_NATIVE_PATH", nativeLibDir, true);
+            Os.setenv("ANDROID_NATIVE_PATH", gitMain.getParent(), true);
             Os.setenv("GIT_PREFERRED_BIN", nativeGitPath, true);
             Os.setenv("GIT_BINARY", nativeGitPath, true);
+            Os.setenv("GIT_NATIVE_HELPERS", helperPath, true);
+
+
+
 
 
 
@@ -406,7 +504,8 @@ public class GitManager {
             if (!templateDir.exists()) templateDir.mkdirs();
             Os.setenv("GIT_TEMPLATE_DIR", templateDir.getAbsolutePath(), true);
 
-            Os.setenv("GIT_EXEC_PATH", corePath, true);
+            Os.setenv("GIT_EXEC_PATH", helperPath, true);
+
             Os.setenv("HOME", context.getFilesDir().getAbsolutePath(), true);
 
 

@@ -67,14 +67,28 @@ public class Polyfill {
                                 + "const __polyfillRequire = __polyfillCreateRequire(import.meta.url);\n"
                                 + "const __polyfillPath = __polyfillRequire('path');\n"
                                 + "const __polyfillFs = __polyfillRequire('fs');\n"
+                                + "const __polyfillChildProcess = __polyfillRequire('child_process');\n"
+                                + "const __polyfillRealSpawn = __polyfillChildProcess.spawn;\n"
+                                + "const __polyfillRealExecFile = __polyfillChildProcess.execFile;\n"
                                 + "const preferredGit = process.env.GIT_BINARY || process.env.GIT_PREFERRED_BIN || (process.env.ANDROID_NATIVE_PATH && __polyfillPath.join(process.env.ANDROID_NATIVE_PATH, 'git'));\n"
                                 + "if (preferredGit && __polyfillFs.existsSync(preferredGit)) {\n"
+                                + "  const preferredDir = __polyfillPath.dirname(preferredGit);\n"
                                 + "  process.env.GIT_BINARY = preferredGit;\n"
-                                + "  process.env.PATH = preferredGit + ':' + process.env.PATH;\n"
+                                + "  process.env.PATH = preferredDir + ':' + process.env.PATH;\n"
+                                + "  process.env.ANDROID_NATIVE_PATH = preferredDir;\n"
                                 + "  console.log('[Polyfill] Using preferred git:', preferredGit);\n"
+                                + "  __polyfillChildProcess.spawn = function(cmd, args, options) {\n"
+                                + "    if (cmd === 'git' || cmd === 'git.exe') cmd = preferredGit;\n"
+                                + "    return __polyfillRealSpawn.call(this, cmd, args, options);\n"
+                                + "  };\n"
+                                + "  __polyfillChildProcess.execFile = function(cmd, args, options, callback) {\n"
+                                + "    if (cmd === 'git' || cmd === 'git.exe') cmd = preferredGit;\n"
+                                + "    return __polyfillRealExecFile.call(this, cmd, args, options, callback);\n"
+                                + "  };\n"
                                 + "} else {\n"
                                 + "  console.log('[Polyfill] No preferred git found, PATH=', process.env.PATH);\n"
                                 + "}\n";
+
 
 
                         if (line.startsWith("#!")) {

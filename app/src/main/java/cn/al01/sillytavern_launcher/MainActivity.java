@@ -12,12 +12,16 @@ import android.os.Bundle;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.LayoutInflater;
+import org.json.JSONObject;
+
 import android.view.View;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -53,9 +57,15 @@ public class MainActivity extends AppCompatActivity {
     private ScrollView scrollLog;
     private Button btnClearLog;
 
+    private volatile boolean gitAvailable = false;
+    private String gitFailureReason = "";
+
     private final AppLogger logger = AppLogger.getInstance();
+    private ExtensionInstaller extensionInstaller;
+
 
     private static boolean nodeLibLoaded = false;
+
     private static boolean nativeLibLoaded = false;
 
     static {
@@ -139,9 +149,13 @@ public class MainActivity extends AppCompatActivity {
             btnLaunch.setEnabled(false);
             btnLaunch.setText("正在启动...");
             logger.i(TAG, "用户点击启动按钮");
+            if (!gitAvailable) {
+                logger.w(TAG, "无 Git 模式下启动：扩展安装不可用");
+            }
             startSillyTavern();
             watchSillyTavernOutput();
         });
+
     }
 
     /** 更新日志文件路径提示 */
@@ -277,6 +291,10 @@ public class MainActivity extends AppCompatActivity {
 
     private void initWebView() {
         WebSettings settings = webView.getSettings();
+        extensionInstaller = new ExtensionInstaller(this);
+
+
+
 
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
@@ -295,10 +313,18 @@ public class MainActivity extends AppCompatActivity {
 
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
 
+        webView.addJavascriptInterface(new ExtensionBridge(), "AndroidExtensionBridge");
+
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return false;
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                injectExtensionInterceptor();
             }
 
             @Override
@@ -310,6 +336,62 @@ public class MainActivity extends AppCompatActivity {
         WebView.setWebContentsDebuggingEnabled(true);
         logger.i(TAG, "WebView 初始化完成");
     }
+
+    private void injectExtensionInterceptor() {
+        String script = "(() => {" +
+                " if (window.__extensionInterceptorInstalled) return;" +
+                " window.__extensionInterceptorInstalled = true;" +
+                " const originalFetch = window.fetch;" +
+                " window.fetch = async function(input, init = {}) {" +
+                "   try {" +
+                "     const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');" +
+                "     const method = (init.method || (input.method ? input.method : 'GET')).toUpperCase();" +
+                "     if (url && url.includes('/api/extensions/install') && method === 'POST') {" +
+                "       const body = init.body ? init.body : (input.body ? await input.clone().text() : '');" +
+                "       const response = await window.AndroidExtensionBridge.installExtension(body || '{}');" +
+                "       const parsed = JSON.parse(response);" +
+                "       const payload = JSON.stringify(parsed.body || {});" +
+                "       const headers = new Headers({'Content-Type': 'application/json'});" +
+                "       return new Response(payload, { status: parsed.status || 200, headers });" +
+                "     }" +
+                "   } catch (err) {" +
+                "     console.error('[ExtensionInterceptor] Failed to intercept', err);" +
+                "   }" +
+                "   return originalFetch.call(this, input, init);" +
+                " };" +
+                " console.log('[ExtensionInterceptor] Installed');" +
+                "})();";
+        webView.evaluateJavascript(script, null);
+    }
+
+    private class ExtensionBridge {
+        @JavascriptInterface
+        public String installExtension(String payload) {
+            InstallResultHolder holder = new InstallResultHolder();
+            Thread worker = new Thread(() -> {
+                ExtensionInstaller.InstallResult result = extensionInstaller.installFromJson(payload);
+                holder.json = result.toJson();
+                logger.i(TAG, "扩展安装回调: " + result.message + " -> " + result.targetPath);
+
+            });
+            try {
+                worker.start();
+                worker.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (holder.json == null) {
+                holder.json = "{\"status\":500}";
+            }
+            return holder.json;
+        }
+    }
+
+    private static class InstallResultHolder {
+        volatile String json;
+    }
+
+
 
     private void setupBaseEnvironment() {
         try {
@@ -388,25 +470,26 @@ public class MainActivity extends AppCompatActivity {
         logger.i(TAG, "开始配置 Git 环境...");
         new Thread(() -> {
             boolean gitReady = GitManager.setup(this);
+            gitAvailable = gitReady;
+            gitFailureReason = gitReady ? "" : GitManager.getLastErrorSummary();
             runOnUiThread(() -> {
                 if (gitReady) {
                     logger.i(TAG, "Git 环境配置成功");
                     emitStartupSelfCheckReport("after-git-setup", stFolder, true);
                     ensureGitRepo(stFolder);
                 } else {
-                    String reason = GitManager.getLastErrorSummary();
-                    if (reason == null || reason.trim().isEmpty()) {
-                        reason = "未知原因（请查看 GitManager 详细日志）";
+                    if (gitFailureReason == null || gitFailureReason.trim().isEmpty()) {
+                        gitFailureReason = "未知原因（请查看 GitManager 详细日志）";
                     }
-                    logger.e(TAG, "Git 环境配置失败: " + reason);
+                    logger.e(TAG, "Git 环境配置失败: " + gitFailureReason);
                     emitStartupSelfCheckReport("after-git-setup", stFolder, false);
-                    btnLaunch.setText("Git失败: 点日志看原因");
+                    enterGitDegradedMode();
                 }
-
-
             });
         }).start();
     }
+
+
 
     private void startSillyTavern() {
         File stFolder = SillyTavern.getRootFolder(this);
@@ -433,6 +516,9 @@ public class MainActivity extends AppCompatActivity {
      */
     private void watchSillyTavernOutput() {
         new Thread(() -> {
+            if (!gitAvailable) {
+                logger.w(TAG, "无 Git 模式：扩展安装与仓库同步不可用");
+            }
             Process logcatProcess = null;
             try {
                 // 用 -T 1 从最新一条开始读，避免读到历史日志
@@ -446,6 +532,7 @@ public class MainActivity extends AppCompatActivity {
                 logger.i(TAG, "开始监听酒馆启动日志...");
                 String line;
                 while ((line = reader.readLine()) != null) {
+
                     // logcat 格式: "I/NodeJS-Output( pid): 实际内容"
                     // 提取冒号后面的实际输出内容
                     String content = extractLogcatContent(line);
@@ -552,60 +639,77 @@ public class MainActivity extends AppCompatActivity {
      * 自动初始化 Git 仓库
      */
     private void ensureGitRepo(File folder) {
+        if (!gitAvailable) {
+            logger.w(TAG, "gitAvailable=false，直接启用启动按钮");
+            btnLaunch.setEnabled(true);
+            btnLaunch.setText("一键启动酒馆 (无 Git)");
+            return;
+        }
+
         File gitDir = new File(folder, ".git");
         if (!gitDir.exists()) {
             logger.i(TAG, "Git 仓库不存在，开始初始化: " + folder.getAbsolutePath());
-            try {
-                btnLaunch.setEnabled(false);
-                btnLaunch.setText("正在初始化 Git 元数据");
+            if (!gitAvailable) {
+                logger.w(TAG, "当前处于无 Git 模式，跳过 git init");
+            } else {
+                try {
+                    btnLaunch.setEnabled(false);
+                    btnLaunch.setText("正在初始化 Git 元数据");
 
-                File gitExecFile = GitManager.getLastGitExecutable();
-                String gitExec;
-                if (gitExecFile != null && gitExecFile.exists()) {
-                    gitExec = gitExecFile.getAbsolutePath();
-                    logger.i(TAG, "git init 复用已验证可执行: " + gitExec);
-                } else {
-                    gitExec = new File(getFilesDir(), "git/libexec/git-core/git").getAbsolutePath();
-                    logger.w(TAG, "GitManager 尚未缓存路径，回退到 filesDir: " + gitExec);
+                    File gitExecFile = GitManager.getLastGitExecutable();
+                    String gitExec;
+                    if (gitExecFile != null && gitExecFile.exists()) {
+                        gitExec = gitExecFile.getAbsolutePath();
+                        logger.i(TAG, "git init 复用已验证可执行: " + gitExec);
+                    } else {
+                        gitExec = new File(getFilesDir(), "git/libexec/git-core/git").getAbsolutePath();
+                        logger.w(TAG, "GitManager 尚未缓存路径，回退到 filesDir: " + gitExec);
+                    }
+
+                    ProcessBuilder pb = new ProcessBuilder(gitExec, "init");
+
+                    String currentPath = Os.getenv("PATH");
+                    String nativeHint = Os.getenv("ANDROID_NATIVE_PATH");
+                    if (!TextUtils.isEmpty(currentPath)) {
+                        logger.i(TAG, "git init PATH=" + currentPath);
+                    }
+                    if (!TextUtils.isEmpty(nativeHint)) {
+                        logger.i(TAG, "git init ANDROID_NATIVE_PATH=" + nativeHint);
+                    }
+
+                    pb.environment().put("PATH", currentPath);
+                    pb.environment().put("LD_LIBRARY_PATH", Os.getenv("LD_LIBRARY_PATH"));
+                    pb.environment().put("HOME", Os.getenv("HOME"));
+                    pb.environment().put("GIT_EXEC_PATH", Os.getenv("GIT_EXEC_PATH"));
+                    pb.environment().put("ANDROID_NATIVE_PATH", nativeHint);
+                    pb.environment().put("GIT_PREFERRED_BIN", Os.getenv("GIT_PREFERRED_BIN"));
+                    pb.environment().put("GIT_BINARY", Os.getenv("GIT_BINARY"));
+
+
+
+
+                    pb.directory(folder);
+                    pb.redirectErrorStream(true);
+                    Process p = pb.start();
+                    p.waitFor();
+                    logger.i(TAG, "git init 完成，退出码=" + p.exitValue());
+
+                } catch (Exception e) {
+                    logger.e(TAG, "git init 失败", e);
                 }
-
-                ProcessBuilder pb = new ProcessBuilder(gitExec, "init");
-
-                String currentPath = Os.getenv("PATH");
-                String nativeHint = Os.getenv("ANDROID_NATIVE_PATH");
-                if (!TextUtils.isEmpty(currentPath)) {
-                    logger.i(TAG, "git init PATH=" + currentPath);
-                }
-                if (!TextUtils.isEmpty(nativeHint)) {
-                    logger.i(TAG, "git init ANDROID_NATIVE_PATH=" + nativeHint);
-                }
-
-                pb.environment().put("PATH", currentPath);
-                pb.environment().put("LD_LIBRARY_PATH", Os.getenv("LD_LIBRARY_PATH"));
-                pb.environment().put("HOME", Os.getenv("HOME"));
-                pb.environment().put("GIT_EXEC_PATH", Os.getenv("GIT_EXEC_PATH"));
-                pb.environment().put("ANDROID_NATIVE_PATH", nativeHint);
-                pb.environment().put("GIT_PREFERRED_BIN", Os.getenv("GIT_PREFERRED_BIN"));
-                pb.environment().put("GIT_BINARY", Os.getenv("GIT_BINARY"));
-
-
-
-
-                pb.directory(folder);
-                pb.redirectErrorStream(true);
-                Process p = pb.start();
-                p.waitFor();
-                logger.i(TAG, "git init 完成，退出码=" + p.exitValue());
-
-            } catch (Exception e) {
-                logger.e(TAG, "git init 失败", e);
             }
         } else {
             logger.i(TAG, "Git 仓库已存在，跳过初始化");
         }
 
+        if (!gitAvailable) {
+            logger.w(TAG, "无 Git 模式，无需重复 setup");
+            return;
+        }
+
         new Thread(() -> {
             boolean gitReady = GitManager.setup(this);
+            gitAvailable = gitReady;
             runOnUiThread(() -> {
                 if (gitReady) {
                     logger.i(TAG, "Git 就绪，启动按钮已启用");
@@ -616,12 +720,28 @@ public class MainActivity extends AppCompatActivity {
                     btnLaunch.setText("一键启动酒馆");
                 } else {
                     logger.e(TAG, "Git 最终检查失败");
-                    btnLaunch.setText("Git 元数据，初始化失败");
+                    enterGitDegradedMode();
                 }
 
             });
         }).start();
     }
+
+    private void enterGitDegradedMode() {
+        gitAvailable = false;
+        runOnUiThread(() -> {
+            btnLaunch.setEnabled(true);
+            btnLaunch.setText("一键启动酒馆 (无 Git)");
+        });
+        if (gitFailureReason == null || gitFailureReason.trim().isEmpty()) {
+            gitFailureReason = "未知原因";
+        }
+        logger.w(TAG, "进入 Git 降级模式: " + gitFailureReason);
+        logger.w(TAG, "此模式下不可安装扩展、不可使用 git init/clone/pull");
+    }
+
+
+
 
     private void showProgressDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);

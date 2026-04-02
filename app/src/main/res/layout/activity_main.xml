@@ -10,26 +10,109 @@
         android:layout_height="match_parent"
         android:visibility="gone" />
 
-    <!-- 启动界面的容器 -->
+    <!-- 启动界面的容器（垂直线性，上部按钮区 + 下部日志区） -->
     <LinearLayout
         android:id="@+id/main_container"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:orientation="vertical"
-        android:gravity="center">
+        android:orientation="vertical">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/app_name"
-            android:textSize="20sp"
-            android:layout_marginBottom="20dp"/>
+        <!-- 上半部分：标题 + 启动按钮 + 日志文件路径提示 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
 
-        <Button
-            android:id="@+id/btn_launch"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/extracting_title" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_name"
+                android:textSize="20sp"
+                android:layout_marginBottom="20dp" />
+
+            <Button
+                android:id="@+id/btn_launch"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/extracting_title" />
+
+            <!-- 日志文件路径提示 -->
+            <TextView
+                android:id="@+id/tv_log_path"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:paddingHorizontal="16dp"
+                android:textSize="11sp"
+                android:textColor="#888888"
+                android:gravity="center"
+                android:text="" />
+
+        </LinearLayout>
+
+        <!-- 日志显示区域 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="2"
+            android:orientation="vertical"
+            android:background="#1A1A1A">
+
+            <!-- 标题栏 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:background="#2D2D2D"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="6dp"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/log_panel_title"
+                    android:textColor="#AAAAAA"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/btn_clear_log"
+                    android:layout_width="wrap_content"
+                    android:layout_height="32dp"
+                    style="?android:attr/buttonStyleSmall"
+                    android:text="@string/log_clear"
+                    android:textSize="11sp"
+                    android:textColor="#CCCCCC"
+                    android:background="#444444"
+                    android:paddingHorizontal="10dp" />
+
+            </LinearLayout>
+
+            <!-- 日志滚动区 -->
+            <ScrollView
+                android:id="@+id/scroll_log"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:fillViewport="true">
+
+                <TextView
+                    android:id="@+id/tv_log"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:padding="8dp"
+                    android:textColor="#CCCCCC"
+                    android:textSize="11sp"
+                    android:fontFamily="monospace"
+                    android:lineSpacingExtra="2dp"
+                    android:text="" />
+
+            </ScrollView>
+
+        </LinearLayout>
 
     </LinearLayout>
+
 </FrameLayout>

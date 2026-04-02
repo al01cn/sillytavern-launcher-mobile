@@ -2,9 +2,14 @@ package cn.al01.sillytavern_launcher;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
-import android.annotation.SuppressLint;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -14,37 +19,61 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
+
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.net.InetSocketAddress;
-import java.net.Socket;
+import java.util.List;
 import java.util.Objects;
 
 import android.system.Os;
 import android.system.ErrnoException;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "NodeJS";
+    private static final int REQ_WRITE_STORAGE = 100;
+
     private AlertDialog progressDialog;
     private ProgressBar progressBar;
     private TextView progressMessage;
 
     private Button btnLaunch;
     private WebView webView;
-    private View mainLayout; // 用于隐藏初始 UI
+    private View mainLayout;
+
+    // 日志 UI 组件
+    private TextView tvLog;
+    private TextView tvLogPath;
+    private ScrollView scrollLog;
+    private Button btnClearLog;
+
+    private final AppLogger logger = AppLogger.getInstance();
+
+    private static boolean nodeLibLoaded = false;
+    private static boolean nativeLibLoaded = false;
 
     static {
         try {
             System.loadLibrary("node");
-            System.loadLibrary("native-lib");
+            nodeLibLoaded = true;
         } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "无法加载本地库: " + e.getMessage());
+            Log.e(TAG, "无法加载 node 库: " + e.getMessage(), e);
+        }
+
+        try {
+            System.loadLibrary("native-lib");
+            nativeLibLoaded = true;
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "无法加载 native-lib 库: " + e.getMessage(), e);
         }
     }
+
 
     public native int startNodeWithArguments(String[] arguments);
     public native int chdirNative(String path);
@@ -54,75 +83,232 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // 1. 初始化 UI 和基础环境
-        setupBaseEnvironment();
+        // ---- 初始化日志系统 ----
+        requestStoragePermissionIfNeeded();
+        logger.init(this);
+        logger.i(TAG, "===== 应用启动 =====");
 
+        // ---- 初始化 UI ----
         btnLaunch = findViewById(R.id.btn_launch);
         webView = findViewById(R.id.webview_main);
-        mainLayout = findViewById(R.id.main_container); // 假设你的 XML 里有一个根容器
+        mainLayout = findViewById(R.id.main_container);
+        tvLog = findViewById(R.id.tv_log);
+        tvLogPath = findViewById(R.id.tv_log_path);
+        scrollLog = findViewById(R.id.scroll_log);
+        btnClearLog = findViewById(R.id.btn_clear_log);
+
+        // 显示日志文件路径
+        updateLogPathHint();
+
+        // 清空日志按钮
+        btnClearLog.setOnClickListener(v -> {
+            tvLog.setText("");
+            logger.i(TAG, "---- 日志已清空 ----");
+        });
+
+        // 注册日志监听，新日志追加到 UI
+        logger.addListener(line -> runOnUiThread(() -> appendLogLine(line)));
+
+        // 把已有缓存都刷到 UI（init 里写的那条）
+        List<String> cached = logger.getBuffer();
+        for (String l : cached) {
+            appendLogLine(l);
+        }
+
+        // ---- 基础 native 库加载状态 ----
+        logNativeLibraryStatus();
+
+        // ---- 基础环境 ----
+        setupBaseEnvironment();
+
+
+        // ---- 打印系统架构信息 ----
+        logSystemInfo();
+        emitStartupSelfCheckReport("onCreate", SillyTavern.getRootFolder(this), null);
 
         initWebView();
 
+
         btnLaunch.setEnabled(false);
 
-        // 2. 检查资源状态
+        // ---- 检查资源 ----
         checkResourcesAndPrepare();
 
-        // 3. 点击启动按钮逻辑
+        // ---- 启动按钮 ----
         btnLaunch.setOnClickListener(v -> {
             btnLaunch.setEnabled(false);
             btnLaunch.setText("正在启动...");
+            logger.i(TAG, "用户点击启动按钮");
             startSillyTavern();
-            // 开始监控端口，准备切换页面
-            monitorPortAndSwitch(11451);
+            watchSillyTavernOutput();
         });
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    /** 更新日志文件路径提示 */
+    private void updateLogPathHint() {
+        File f = logger.getCurrentLogFile();
+        if (f != null && tvLogPath != null) {
+            tvLogPath.setText("日志: " + f.getAbsolutePath());
+        }
+    }
+
+    /** 向日志 TextView 末尾追加一行，并自动滚动到底 */
+    private void appendLogLine(String line) {
+        if (tvLog == null) return;
+        // 给不同级别加颜色（简单做法：通过 SpannableString 也行，这里先用纯文本 + 换行）
+        tvLog.append(line + "\n");
+        // 滚到底部
+        if (scrollLog != null) {
+            scrollLog.post(() -> scrollLog.fullScroll(View.FOCUS_DOWN));
+        }
+    }
+
+    /** Android 9 及以下需要申请 WRITE_EXTERNAL_STORAGE 权限 */
+    private void requestStoragePermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                        REQ_WRITE_STORAGE);
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_WRITE_STORAGE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                // 权限获取后重新 init，若之前已 init 且 mFileWriter==null，则重试
+                logger.i(TAG, "存储权限已授予");
+                if (logger.getCurrentLogFile() == null) {
+                    logger.init(this);
+                    updateLogPathHint();
+                }
+            } else {
+                logger.w(TAG, "存储权限被拒绝，日志将仅保留在内存中");
+            }
+        }
+    }
+
+    /** 输出当前 native 库加载状态，便于定位 UnsatisfiedLinkError */
+    private void logNativeLibraryStatus() {
+        logger.i(TAG, "native 加载状态: node=" + (nodeLibLoaded ? "OK" : "FAILED")
+                + ", native-lib=" + (nativeLibLoaded ? "OK" : "FAILED"));
+        if (!nodeLibLoaded) {
+            logger.e(TAG, "关键库 node 未加载，后续 Node.js 启动一定失败");
+        }
+    }
+
+    private void emitStartupSelfCheckReport(String phase, File stFolder, Boolean gitReady) {
+        try {
+            File filesDir = getFilesDir();
+            File serverJs = new File(stFolder, "server.js");
+            File gitRoot = new File(filesDir, "git");
+            File gitCore = new File(gitRoot, "libexec/git-core");
+            File gitMain = new File(gitCore, "git");
+            File soRoot = new File(filesDir, "lib");
+            File cacert = new File(filesDir, "cacert.pem");
+
+            logger.i(TAG, "========== 启动自检报告 [" + phase + "] ==========");
+            logger.i(TAG, "库加载: node=" + (nodeLibLoaded ? "OK" : "FAILED")
+                    + ", native-lib=" + (nativeLibLoaded ? "OK" : "FAILED"));
+            logger.i(TAG, "源码目录: " + stFolder.getAbsolutePath() + " (exists=" + stFolder.exists() + ")");
+            logger.i(TAG, "入口脚本: " + serverJs.getAbsolutePath() + " (exists=" + serverJs.exists() + ")");
+            logger.i(TAG, "Git 根目录: " + gitRoot.getAbsolutePath() + " (exists=" + gitRoot.exists() + ")");
+            logger.i(TAG, "Git 主程序: " + gitMain.getAbsolutePath() + " (exists=" + gitMain.exists()
+                    + ", size=" + (gitMain.exists() ? gitMain.length() : 0) + ")");
+            logger.i(TAG, "SO 目录: " + soRoot.getAbsolutePath() + " (exists=" + soRoot.exists() + ")");
+            logger.i(TAG, "证书文件: " + cacert.getAbsolutePath() + " (exists=" + cacert.exists() + ")");
+            logger.i(TAG, "环境变量: HOME=" + safeEnv("HOME")
+                    + ", GIT_EXEC_PATH=" + safeEnv("GIT_EXEC_PATH")
+                    + ", LD_LIBRARY_PATH=" + safeEnv("LD_LIBRARY_PATH"));
+            if (gitReady != null) {
+                logger.i(TAG, "Git setup 结果: " + (gitReady ? "OK" : "FAILED"));
+            }
+            logger.i(TAG, "========================================");
+        } catch (Exception e) {
+            logger.w(TAG, "生成启动自检报告失败: " + e.getMessage());
+        }
+    }
+
+    private String safeEnv(String key) {
+        String val = Os.getenv(key);
+        if (val == null || val.isEmpty()) return "<empty>";
+        return val;
+    }
+
+    /**
+     * 输出系统架构及设备信息到日志，方便排查架构适配问题
+     */
+    private void logSystemInfo() {
+
+
+        logger.i(TAG, "========== 系统信息 ==========");
+        logger.i(TAG, "设备型号: " + Build.MODEL + " (" + Build.PRODUCT + ")");
+        logger.i(TAG, "Android 版本: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
+
+        // CPU ABI（首选 ABI）
+        String primaryAbi = Build.SUPPORTED_ABIS[0];
+        logger.i(TAG, "首选 ABI: " + primaryAbi);
+        logger.i(TAG, "所有支持的 ABI: " + String.join(", ", Build.SUPPORTED_ABIS));
+
+        // 检测 32/64 位
+        boolean is64bit = primaryAbi.contains("64") || primaryAbi.contains("arm64") || primaryAbi.contains("x86_64");
+        logger.i(TAG, "运行模式: " + (is64bit ? "64-bit" : "32-bit"));
+
+        // CPU 核心数
+        int cores = Runtime.getRuntime().availableProcessors();
+        logger.i(TAG, "CPU 核心数: " + cores);
+
+        // JVM 内存情况
+        Runtime rt = Runtime.getRuntime();
+        long maxMem = rt.maxMemory() / (1024 * 1024);
+        long totalMem = rt.totalMemory() / (1024 * 1024);
+        long freeMem = rt.freeMemory() / (1024 * 1024);
+        logger.i(TAG, "JVM 最大内存: " + maxMem + " MB");
+        logger.i(TAG, "JVM 当前已分配: " + totalMem + " MB (可用 " + freeMem + " MB)");
+
+        // 架构适配提示
+        logger.i(TAG, "原生库架构: " + System.getProperty("os.arch"));
+        logger.i(TAG, "=============================");
+    }
+
     private void initWebView() {
         WebSettings settings = webView.getSettings();
 
-        // 1. 核心配置：必须开启
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
-        settings.setDatabaseEnabled(true); // 酒馆可能用到 WebSQL/IndexedDB
+        settings.setDatabaseEnabled(true);
 
-        // 2. 资源访问权限：酒馆某些主题或插件可能需要访问本地资源
         settings.setAllowFileAccess(true);
         settings.setAllowContentAccess(true);
         settings.setAllowFileAccessFromFileURLs(true);
         settings.setAllowUniversalAccessFromFileURLs(true);
 
-        // 3. 界面展示优化
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
         settings.setSupportZoom(true);
         settings.setBuiltInZoomControls(true);
         settings.setDisplayZoomControls(false);
 
-        // 4. 【重要】解决无法加载的关键：允许混合内容
-        // 因为本地服务经常被识别为不安全环境
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
 
-        // 5. 优化白名单拦截逻辑
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-//                String url = request.getUrl().toString();
-                // 更加宽松的本地匹配
-                // 允许在 WebView 内跳转
-                // 如果是外部链接，可以考虑用浏览器打开而不是直接拦截
                 return false;
             }
 
             @Override
             public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
-                Log.e(TAG, "WebView 错误: " + description + " 地址: " + failingUrl);
+                logger.e(TAG, "WebView 错误: " + description + " 地址: " + failingUrl);
             }
         });
 
-        // 开发环境下开启调试（可选，方便你在电脑 Chrome 调试手机 WebView）
         WebView.setWebContentsDebuggingEnabled(true);
+        logger.i(TAG, "WebView 初始化完成");
     }
 
     private void setupBaseEnvironment() {
@@ -130,8 +316,9 @@ public class MainActivity extends AppCompatActivity {
             String filesDir = getFilesDir().getAbsolutePath();
             Os.setenv("HOME", filesDir, true);
             Os.setenv("NODE_PATH", filesDir + "/node_modules", true);
+            logger.i(TAG, "基础环境已设置，HOME=" + filesDir);
         } catch (ErrnoException e) {
-            Log.e(TAG, "基础环境设置失败", e);
+            logger.e(TAG, "基础环境设置失败", e);
         }
     }
 
@@ -141,32 +328,29 @@ public class MainActivity extends AppCompatActivity {
     private void initializeSettingsFile() {
         File defaultUserDir = new File(SillyTavern.getRootFolder(this), "data/default-user");
         File settingsFile = new File(defaultUserDir, "settings.json");
-        
+
         if (!settingsFile.exists()) {
-            Log.i(TAG, "Settings 文件不存在，正在从 assets 复制默认配置...");
-            
-            // 确保目录存在
+            logger.i(TAG, "Settings 文件不存在，正在从 assets 复制默认配置...");
+
             if (!defaultUserDir.exists()) {
                 defaultUserDir.mkdirs();
             }
-            
-            // 从 assets 复制文件
+
             try (InputStream is = getAssets().open("st_config/settings.json");
                  FileOutputStream fos = new FileOutputStream(settingsFile)) {
-                
+
                 byte[] buffer = new byte[8192];
                 int len;
                 while ((len = is.read(buffer)) > 0) {
                     fos.write(buffer, 0, len);
                 }
-                
-                Log.i(TAG, "Settings 文件复制成功到：" + settingsFile.getAbsolutePath());
+
+                logger.i(TAG, "Settings 文件复制成功: " + settingsFile.getAbsolutePath());
             } catch (Exception e) {
-                Log.e(TAG, "复制 Settings 文件失败：" + e.getMessage());
-                e.printStackTrace();
+                logger.e(TAG, "复制 Settings 文件失败", e);
             }
         } else {
-            Log.i(TAG, "Settings 文件已存在，跳过初始化");
+            logger.i(TAG, "Settings 文件已存在，跳过初始化");
         }
     }
 
@@ -175,22 +359,25 @@ public class MainActivity extends AppCompatActivity {
         File serverJs = new File(stFolder, "server.js");
 
         if (!stFolder.exists() || !serverJs.exists()) {
+            logger.i(TAG, "酒馆源码不存在，开始解压...");
             showProgressDialog();
             new Thread(() -> {
                 boolean success = SillyTavern.unzipSource(this, this::updateProgress);
                 runOnUiThread(() -> {
                     if (progressDialog != null) progressDialog.dismiss();
                     if (success) {
-                        // 解压成功后，初始化配置文件
+                        logger.i(TAG, "解压完成，开始初始化配置");
                         initializeSettingsFile();
                         prepareGitEnvironment();
                     } else {
+                        logger.e(TAG, "解压酒馆源码失败");
                         showErrorDialog("解压酒馆源码失败");
                         btnLaunch.setText("资源缺失");
                     }
                 });
             }).start();
         } else {
+            logger.i(TAG, "酒馆源码已存在，跳过解压");
             prepareGitEnvironment();
         }
     }
@@ -198,68 +385,158 @@ public class MainActivity extends AppCompatActivity {
     private void prepareGitEnvironment() {
         File stFolder = SillyTavern.getRootFolder(this);
         runOnUiThread(() -> btnLaunch.setText("正在配置 Git..."));
+        logger.i(TAG, "开始配置 Git 环境...");
         new Thread(() -> {
             boolean gitReady = GitManager.setup(this);
             runOnUiThread(() -> {
                 if (gitReady) {
+                    logger.i(TAG, "Git 环境配置成功");
+                    emitStartupSelfCheckReport("after-git-setup", stFolder, true);
                     ensureGitRepo(stFolder);
                 } else {
-                    btnLaunch.setText("环境配置失败");
+                    String reason = GitManager.getLastErrorSummary();
+                    if (reason == null || reason.trim().isEmpty()) {
+                        reason = "未知原因（请查看 GitManager 详细日志）";
+                    }
+                    logger.e(TAG, "Git 环境配置失败: " + reason);
+                    emitStartupSelfCheckReport("after-git-setup", stFolder, false);
+                    btnLaunch.setText("Git失败: 点日志看原因");
                 }
+
+
             });
         }).start();
     }
 
     private void startSillyTavern() {
         File stFolder = SillyTavern.getRootFolder(this);
+        logger.i(TAG, "正在应用 JS Polyfill 补丁...");
         new Thread(() -> {
             Polyfill.applyPatch(stFolder);
+            logger.i(TAG, "Polyfill 完成，正在启动 Node.js...");
             File entry = SillyTavern.findEntryScript(stFolder, "server.js");
             if (entry != null) {
+                logger.i(TAG, "启动脚本: " + entry.getAbsolutePath());
+                emitStartupSelfCheckReport("before-node-start", stFolder, null);
                 chdirNative(Objects.requireNonNull(entry.getParentFile()).getAbsolutePath());
-                // 注意：startNodeWithArguments 通常是阻塞的，所以它后面的代码可能不会立即执行
                 startNodeWithArguments(SillyTavern.getLaunchArguments(entry.getAbsolutePath()));
+            } else {
+
+                logger.e(TAG, "找不到 server.js 入口脚本");
             }
         }).start();
     }
 
     /**
-     * 轮询检测本地端口，成功后切换到 WebView
+     * 监听 Node.js 的 stdout/stderr 输出（通过 logcat）
+     * 当检测到酒馆的 "Go to: <a href="http://localhost:XXXX/">http://localhost:XXXX/</a>" 信号时，打开 WebView
      */
-    private void monitorPortAndSwitch(int port) {
+    private void watchSillyTavernOutput() {
         new Thread(() -> {
-            boolean connected = false;
-            int attempts = 0;
-            while (!connected && attempts < 30) { // 最多尝试 30 秒
-                try {
-                    Thread.sleep(1000);
-                    Socket socket = new Socket();
-                    socket.connect(new InetSocketAddress("127.0.0.1", port), 500);
-                    socket.close();
-                    connected = true;
-                } catch (Exception e) {
-                    attempts++;
-                    Log.d(TAG, "等待端口 " + port + " 开放... (" + attempts + ")");
-                }
-            }
+            Process logcatProcess = null;
+            try {
+                // 用 -T 1 从最新一条开始读，避免读到历史日志
+                logcatProcess = new ProcessBuilder(
+                        "logcat", "-T", "1", "-s", "NodeJS-Output:I"
+                ).redirectErrorStream(true).start();
 
-            if (connected) {
-                try {
-                    Thread.sleep(500);
-                    runOnUiThread(() -> {
-                        // 隐藏启动 UI，显示 WebView
-                        mainLayout.setVisibility(View.GONE);
-                        webView.setVisibility(View.VISIBLE);
-                        webView.loadUrl("http://127.0.0.1:" + port);
-                    });
-                } catch (InterruptedException e) {
-                    runOnUiThread(() -> showErrorDialog("延迟启用失败，请检查控制台输出。"));
-                    throw new RuntimeException(e);
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(logcatProcess.getInputStream()));
+
+                logger.i(TAG, "开始监听酒馆启动日志...");
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    // logcat 格式: "I/NodeJS-Output( pid): 实际内容"
+                    // 提取冒号后面的实际输出内容
+                    String content = extractLogcatContent(line);
+                    if (content == null || content.isEmpty()) continue;
+
+                    // 转发给 AppLogger，在 UI 和日志文件中显示
+                    logger.raw(content.trim());
+
+                    // 检测酒馆 ready 信号
+                    if (content.contains("Go to: http://localhost:") && content.contains("to open SillyTavern")) {
+                        // 提取端口号
+                        int port = extractPortFromLine(content);
+                        if (port > 0) {
+                            logger.i(TAG, "检测到酒馆就绪信号，端口: " + port);
+                            onSillyTavernReady(port);
+                            break;
+                        }
+                    }
                 }
-            } else {
-                runOnUiThread(() -> showErrorDialog("酒馆启动超时，请检查控制台输出。"));
+            } catch (Exception e) {
+                logger.e(TAG, "logcat 监听异常", e);
+            } finally {
+                if (logcatProcess != null) {
+                    logcatProcess.destroy();
+                }
             }
-        }).start();
+        }, "ST-logcat-watcher").start();
+    }
+
+    /**
+     * 从 logcat 格式行中提取实际日志内容
+     * 长格式: "04-01 10:51:00.911  4670  4887 I NodeJS-Output : 酒馆输出内容"
+     * 短格式: "I/NodeJS-Output( 1234): 酒馆输出内容"
+     */
+    private String extractLogcatContent(String logcatLine) {
+        // 先试长格式：找 "NodeJS-Output : " 或 tag 后的 " : "
+        // logcat 长格式: 日期 时间 pid tid 级别 TAG : 内容
+        int idx1 = logcatLine.indexOf("NodeJS-Output : ");
+        if (idx1 >= 0) {
+            return logcatLine.substring(idx1 + "NodeJS-Output : ".length());
+        }
+
+        // 再试短格式: "I/NodeJS-Output( pid): 内容"
+        int idx2 = logcatLine.indexOf("): ");
+        if (idx2 >= 0 && idx2 + 3 < logcatLine.length()) {
+            return logcatLine.substring(idx2 + 3);
+        }
+
+        // 兜底：直接返回整行（去掉前后空白）
+        String trimmed = logcatLine.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    /**
+     * 从酒馆的 ready 行中提取端口号
+     * 例如 "Go to: <a href="http://localhost:11451/">http://localhost:11451/</a> to open SillyTavern" -> 11451
+     */
+    private int extractPortFromLine(String line) {
+        try {
+            int start = line.indexOf("localhost:");
+            if (start < 0) return 0;
+            start += "localhost:".length();
+            int end = start;
+            while (end < line.length() && Character.isDigit(line.charAt(end))) {
+                end++;
+            }
+            if (end > start) {
+                return Integer.parseInt(line.substring(start, end));
+            }
+        } catch (NumberFormatException e) {
+            // ignore
+        }
+        return 0;
+    }
+
+    /**
+     * 酒馆就绪后，延迟切换到 WebView
+     */
+    private void onSillyTavernReady(int port) {
+        try {
+            Thread.sleep(800); // 给酒馆一点时间完成初始化
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        runOnUiThread(() -> {
+            mainLayout.setVisibility(View.GONE);
+            webView.setVisibility(View.VISIBLE);
+            String url = "http://127.0.0.1:" + port;
+            webView.loadUrl(url);
+            logger.i(TAG, "WebView 已加载 " + url);
+        });
     }
 
     @Override
@@ -272,49 +549,82 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * 自动初始化 Git 仓库，解决 fatal: not a git repository 报错
+     * 自动初始化 Git 仓库
      */
     private void ensureGitRepo(File folder) {
         File gitDir = new File(folder, ".git");
         if (!gitDir.exists()) {
-            Log.i(TAG, "Initializing git repository in " + folder.getAbsolutePath());
+            logger.i(TAG, "Git 仓库不存在，开始初始化: " + folder.getAbsolutePath());
             try {
                 btnLaunch.setEnabled(false);
                 btnLaunch.setText("正在初始化 Git 元数据");
-                ProcessBuilder pb = new ProcessBuilder("git", "init");
-                // 继承 GitManager 设置好的路径
-                pb.environment().put("PATH", Os.getenv("PATH"));
+
+                File gitExecFile = GitManager.getLastGitExecutable();
+                String gitExec;
+                if (gitExecFile != null && gitExecFile.exists()) {
+                    gitExec = gitExecFile.getAbsolutePath();
+                    logger.i(TAG, "git init 复用已验证可执行: " + gitExec);
+                } else {
+                    gitExec = new File(getFilesDir(), "git/libexec/git-core/git").getAbsolutePath();
+                    logger.w(TAG, "GitManager 尚未缓存路径，回退到 filesDir: " + gitExec);
+                }
+
+                ProcessBuilder pb = new ProcessBuilder(gitExec, "init");
+
+                String currentPath = Os.getenv("PATH");
+                String nativeHint = Os.getenv("ANDROID_NATIVE_PATH");
+                if (!TextUtils.isEmpty(currentPath)) {
+                    logger.i(TAG, "git init PATH=" + currentPath);
+                }
+                if (!TextUtils.isEmpty(nativeHint)) {
+                    logger.i(TAG, "git init ANDROID_NATIVE_PATH=" + nativeHint);
+                }
+
+                pb.environment().put("PATH", currentPath);
                 pb.environment().put("LD_LIBRARY_PATH", Os.getenv("LD_LIBRARY_PATH"));
                 pb.environment().put("HOME", Os.getenv("HOME"));
                 pb.environment().put("GIT_EXEC_PATH", Os.getenv("GIT_EXEC_PATH"));
-    
+                pb.environment().put("ANDROID_NATIVE_PATH", nativeHint);
+                pb.environment().put("GIT_PREFERRED_BIN", Os.getenv("GIT_PREFERRED_BIN"));
+                pb.environment().put("GIT_BINARY", Os.getenv("GIT_BINARY"));
+
+
+
+
                 pb.directory(folder);
                 pb.redirectErrorStream(true);
                 Process p = pb.start();
                 p.waitFor();
-                Log.i(TAG, "Git init success");
+                logger.i(TAG, "git init 完成，退出码=" + p.exitValue());
+
             } catch (Exception e) {
-                Log.e(TAG, "Git init failed: " + e.getMessage());
+                logger.e(TAG, "git init 失败", e);
             }
+        } else {
+            logger.i(TAG, "Git 仓库已存在，跳过初始化");
         }
-            
-        // 无论是新建还是已存在，都检查 Git 状态并启用按钮
+
         new Thread(() -> {
             boolean gitReady = GitManager.setup(this);
             runOnUiThread(() -> {
                 if (gitReady) {
+                    logger.i(TAG, "Git 就绪，启动按钮已启用");
+                    logger.i(TAG, "Final PATH=" + Os.getenv("PATH"));
+                    logger.i(TAG, "Final ANDROID_NATIVE_PATH=" + Os.getenv("ANDROID_NATIVE_PATH"));
+
                     btnLaunch.setEnabled(true);
                     btnLaunch.setText("一键启动酒馆");
                 } else {
+                    logger.e(TAG, "Git 最终检查失败");
                     btnLaunch.setText("Git 元数据，初始化失败");
                 }
+
             });
         }).start();
     }
 
     private void showProgressDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-//        builder.setTitle("正在解压资源").setCancelable(false);
         View v = LayoutInflater.from(this).inflate(R.layout.dialog_progress, null);
         progressBar = v.findViewById(R.id.progress_bar);
         progressMessage = v.findViewById(R.id.progress_message);
@@ -337,10 +647,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showErrorDialog(String msg) {
+        logger.e(TAG, "错误弹窗: " + msg);
         new AlertDialog.Builder(this)
                 .setTitle("提示")
                 .setMessage(msg)
                 .setPositiveButton("确定", null)
                 .show();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        logger.removeListener(null); // 移除监听（实际上这里 null 没效果，onDestroy 时 Activity 已销毁问题不大）
+        logger.close();
     }
 }

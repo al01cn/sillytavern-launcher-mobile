@@ -53,24 +53,42 @@ public class Polyfill {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
                 String line;
                 boolean firstLine = true;
-                boolean isEntryFile = fileName.equals("server.js") || fileName.equals("index.js");
+                String normalizedPath = filePath.replace('\\', '/');
+                boolean isEntryFile = fileName.equals("server.js") && normalizedPath.endsWith("/SillyTavern/server.js");
 
                 while ((line = reader.readLine()) != null) {
                     String oldLine = line;
 
                     // 1. 入口文件注入
                     if (firstLine && isEntryFile) {
+
+                        String bootstrap = INTL_POLYFILL
+                                + "import { createRequire as __polyfillCreateRequire } from 'module';\n"
+                                + "const __polyfillRequire = __polyfillCreateRequire(import.meta.url);\n"
+                                + "const __polyfillPath = __polyfillRequire('path');\n"
+                                + "const __polyfillFs = __polyfillRequire('fs');\n"
+                                + "const preferredGit = process.env.GIT_BINARY || process.env.GIT_PREFERRED_BIN || (process.env.ANDROID_NATIVE_PATH && __polyfillPath.join(process.env.ANDROID_NATIVE_PATH, 'git'));\n"
+                                + "if (preferredGit && __polyfillFs.existsSync(preferredGit)) {\n"
+                                + "  process.env.GIT_BINARY = preferredGit;\n"
+                                + "  process.env.PATH = preferredGit + ':' + process.env.PATH;\n"
+                                + "  console.log('[Polyfill] Using preferred git:', preferredGit);\n"
+                                + "} else {\n"
+                                + "  console.log('[Polyfill] No preferred git found, PATH=', process.env.PATH);\n"
+                                + "}\n";
+
+
                         if (line.startsWith("#!")) {
                             content.append(line).append("\n");
-                            content.append(INTL_POLYFILL);
+                            content.append(bootstrap);
                         } else {
-                            content.append(INTL_POLYFILL).append(line).append("\n");
+                            content.append(bootstrap).append(line).append("\n");
                         }
                         changed = true;
                         firstLine = false;
                         continue;
                     }
                     firstLine = false;
+
 
                     // 2. 修复 node-fetch headers.js (最稳妥的改法)
                     if (filePath.contains("node-fetch") && fileName.equals("headers.js")) {

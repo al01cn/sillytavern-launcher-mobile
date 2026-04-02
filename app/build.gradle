@@ -1,26 +1,37 @@
+import org.apache.tools.ant.taskdefs.condition.Os
+
 plugins {
     alias(libs.plugins.android.application)
 }
 
+
+// ============================================================
+// 解决预编译库 SONAME 版本名不匹配问题：
+// Android linker 按 ELF 内嵌的 SONAME（不是文件名）搜索依赖。
+// 预编译库使用版本化 SONAME（OpenSSL 1.1.x、zlib、ssh2 等），
+// 但源文件名没有版本后缀，导致运行时找不到依赖，报 UnsatisfiedLinkError。
+//
+// 解决方案：jniLibs 中已放置版本化副本文件（如 libssl.so.1.1），
+// APK 打包时自动包含，无需构建时 task。
+// 如需重新生成版本化文件，运行 create_versioned_copies.ps1。
+// ============================================================
+
 android {
     namespace 'cn.al01.sillytavern_launcher'
-    compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
-    }
+    compileSdk 34
 
     sourceSets {
         main {
-            jniLibs.srcDirs 'libnode/bin/'
+            jniLibs.srcDirs = ['src/main/jniLibs']
         }
     }
 
     defaultConfig {
         applicationId "cn.al01.sillytavern_launcher"
         minSdk 24
+        targetSdk 34
         versionCode 1
-        versionName '0.1.0'
+        versionName '0.1.1'
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         signingConfig signingConfigs.debug
@@ -64,7 +75,57 @@ android {
     ndkVersion '28.2.13676358'
 }
 
+def gitAbis = ["arm64-v8a", "armeabi-v7a", "x86_64"]
+
+tasks.register("prepareGitExecutables") {
+    doLast {
+        gitAbis.each { abi ->
+            def abiDir = file("src/main/jniLibs/git/${abi}")
+            def srcGit = file("${abiDir}/libexec/git-core/git")
+            def dstGitSo = file("${abiDir}/libgit.so")
+            def dstGitCmd = file("${abiDir}/git")
+
+            if (!srcGit.exists()) {
+                throw new GradleException("缺少 Git 可执行文件: ${srcGit}")
+            }
+
+            copy {
+                from srcGit
+                into abiDir
+                rename { "libgit.so" }
+            }
+
+            copy {
+                from srcGit
+                into abiDir
+                rename { "git" }
+            }
+
+            copy {
+                from srcGit
+                into new File(abiDir, "libexec/git-core")
+                rename { "git" }
+            }
+
+
+            if (Os.isFamily(Os.FAMILY_UNIX) || Os.isFamily(Os.FAMILY_MAC)) {
+                dstGitSo.setExecutable(true, false)
+                dstGitCmd.setExecutable(true, false)
+            }
+
+            println("[prepareGitExecutables] ${abi}: ${srcGit.name} -> libgit.so (${dstGitSo.length()} bytes)")
+            println("[prepareGitExecutables] ${abi}: ${srcGit.name} -> git (${dstGitCmd.length()} bytes)")
+        }
+    }
+}
+
+
+tasks.named("preBuild").configure {
+    dependsOn("prepareGitExecutables")
+}
+
 dependencies {
+
     implementation libs.appcompat
     implementation libs.material
     implementation libs.constraintlayout

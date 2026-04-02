@@ -4,4 +4,6 @@
     <string name="extracting_msg">Initializing resource files, please do not close the app…\nProgress: %1$d%%</string>
     <string name="extract_fail">Extraction failed, please check storage space</string>
     <string name="start_sillytavern">Start SillyTavern</string>
+    <string name="log_panel_title">▶ Debug Log</string>
+    <string name="log_clear">Clear</string>
 </resources>

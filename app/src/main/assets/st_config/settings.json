@@ -5,7 +5,7 @@
     },
     "currentVersion": "1.16.0",
     "username": "User",
-    "max_context": 2048,
+    "max_context": 8192,
     "main_api": "openai",
     "world_info_settings": {
         "world_info": {
